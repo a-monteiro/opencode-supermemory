@@ -304,7 +304,7 @@ function environment(
     },
     memoryClient: memoryClient as unknown as V2RuntimeDependencies["memoryClient"],
     executeTool: executeSupermemoryTool,
-    resolveTags: () => tags,
+    resolveTags: async () => tags,
     logger: () => undefined,
     checkUpdate: async () => ({
       currentVersion: "2.0.15",
@@ -522,6 +522,72 @@ describe("OpenCode 2 runtime", () => {
     });
     expect(h.emitted.map((event) => event.kind)).toEqual(["recalling", "recalled"]);
     h.runtime.cleanup();
+  });
+
+  test("shares one tag resolution per session and caches success", async () => {
+    const env = environment();
+    let calls = 0;
+    let release: (() => void) | null = null;
+    env.deps.resolveTags = async () => {
+      calls++;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return tags;
+    };
+    const runtime = new V2Runtime(env.ctx, env.deps);
+    await runtime.register();
+
+    const first = runtime.handleContext({
+      sessionID: "s1",
+      messages: [request("a", "alpha prompt about caching")],
+    });
+    const second = runtime.handleContext({
+      sessionID: "s1",
+      messages: [request("b", "beta prompt about deploy")],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(1);
+
+    release!();
+    await Promise.all([first, second]);
+    expect(env.queries.length).toBeGreaterThan(0);
+
+    await runtime.handleContext({
+      sessionID: "s1",
+      messages: [request("c", "gamma prompt about testing")],
+    });
+    expect(calls).toBe(1);
+    runtime.cleanup();
+  });
+
+  test("clears in-flight tag resolution after rejection so the next attempt retries", async () => {
+    const env = environment();
+    let calls = 0;
+    let fail = true;
+    env.deps.resolveTags = async () => {
+      calls++;
+      if (fail) throw new Error("tag resolution failed");
+      return tags;
+    };
+    const runtime = new V2Runtime(env.ctx, env.deps);
+    await runtime.register();
+
+    await runtime.handleContext({
+      sessionID: "s1",
+      messages: [request("a", "alpha prompt about caching")],
+    });
+    expect(calls).toBe(1);
+    expect(env.queries).toHaveLength(0);
+
+    fail = false;
+    await runtime.handleContext({
+      sessionID: "s1",
+      messages: [request("b", "beta prompt about deploy")],
+    });
+    expect(calls).toBe(2);
+    expect(env.queries.length).toBeGreaterThan(0);
+    runtime.cleanup();
   });
 });
 
